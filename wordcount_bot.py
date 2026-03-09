@@ -20,6 +20,12 @@ SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "300"))
 MAX_SYNC_PAGES = int(os.getenv("MAX_SYNC_PAGES", "25"))
 MEMBER_CACHE_SECONDS = int(os.getenv("MEMBER_CACHE_SECONDS", "600"))
 BOTS_CACHE_SECONDS = int(os.getenv("BOTS_CACHE_SECONDS", "300"))
+FULL_SYNC_ON_QUERY = os.getenv("FULL_SYNC_ON_QUERY", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 app = Flask(__name__)
 _last_sync_by_group: Dict[str, int] = {}
@@ -258,13 +264,44 @@ def post_to_groupme(text: str, group_id: str, callback_url: str = "") -> None:
         app.logger.warning("GroupMe post exception: %s", exc)
 
 
+def split_for_groupme(text: str, limit: int) -> List[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: List[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+
+
+def post_reply(text: str, group_id: str, callback_url: str = "") -> None:
+    for chunk in split_for_groupme(text, MAX_REPLY_LEN):
+        post_to_groupme(chunk, group_id, callback_url)
+
+
 def maybe_sync_group_messages(group_id: str) -> None:
     if not ACCESS_TOKEN:
         return
 
     now_ts = int(time.time())
     last_sync = _last_sync_by_group.get(group_id, 0)
-    if now_ts - last_sync < SYNC_INTERVAL_SECONDS:
+    if not FULL_SYNC_ON_QUERY and now_ts - last_sync < SYNC_INTERVAL_SECONDS:
         return
 
     before_id = None
@@ -384,7 +421,7 @@ def aggregate_user_rows(group_id: str) -> List[sqlite3.Row]:
             """
             SELECT
                 sender_id,
-                sender_name,
+                MAX(sender_name) AS sender_name,
                 COUNT(*) AS message_count,
                 MIN(created_at) AS first_seen
             FROM messages
@@ -392,7 +429,7 @@ def aggregate_user_rows(group_id: str) -> List[sqlite3.Row]:
               AND sender_type = 'user'
               AND sender_id IS NOT NULL
               AND TRIM(sender_id) <> ''
-            GROUP BY sender_id, sender_name
+            GROUP BY sender_id
             HAVING COUNT(*) > 0
             """,
             (group_id,),
@@ -524,7 +561,7 @@ def leaderboard_text(group_id: str) -> str:
             """
             SELECT
                 sender_id,
-                sender_name,
+                MAX(sender_name) AS sender_name,
                 COUNT(*) AS message_count,
                 COALESCE(SUM(like_count), 0) AS like_total
             FROM messages
@@ -532,7 +569,7 @@ def leaderboard_text(group_id: str) -> str:
               AND sender_type = 'user'
               AND sender_id IS NOT NULL
               AND TRIM(sender_id) <> ''
-            GROUP BY sender_id, sender_name
+            GROUP BY sender_id
             HAVING COUNT(*) > 0
             """,
             (group_id,),
@@ -558,24 +595,37 @@ def leaderboard_text(group_id: str) -> str:
             {
                 "name": name,
                 "ratio": ratio,
+                "likes": likes,
                 "messages": msgs,
             }
         )
 
     ranked.sort(key=lambda r: (r["ratio"], r["messages"], r["name"].lower()), reverse=True)
-    total = len(ranked)
 
     top_slice = ranked[:10]
-    bottom_start = max(total - 10, 0)
-    bottom_slice = ranked[bottom_start:]
+    bottom_pool = [row for row in ranked if row["messages"] > 10]
+    bottom_total = len(bottom_pool)
+    bottom_start = max(bottom_total - 10, 0)
+    bottom_slice = bottom_pool[bottom_start:]
 
     lines = ["top 10"]
     for i, row in enumerate(top_slice, start=1):
-        lines.append(f"{i}. {row['name']} - {format_ratio(row['ratio'])} likes per message")
+        lines.append(
+            f"{i}. {row['name']} - {format_ratio(row['ratio'])} likes per message "
+            f"with {row['likes']} likes on {row['messages']} messages"
+        )
 
+    lines.append("")
+    lines.append("")
     lines.append("bottom 10")
-    for idx, row in enumerate(bottom_slice, start=bottom_start + 1):
-        lines.append(f"{idx}. {row['name']} - {format_ratio(row['ratio'])} likes per message")
+    if not bottom_slice:
+        lines.append("No users with more than 10 messages yet.")
+    else:
+        for idx, row in enumerate(bottom_slice, start=bottom_start + 1):
+            lines.append(
+                f"{idx}. {row['name']} - {format_ratio(row['ratio'])} likes per message "
+                f"with {row['likes']} likes on {row['messages']} messages"
+            )
 
     return "\n".join(lines)
 
@@ -642,8 +692,10 @@ def ordinal_suffix(value: int) -> str:
 def percentile_text_for_entry(entries: List[Dict], target: Dict) -> str:
     below_or_equal = sum(1 for entry in entries if entry["rate"] <= target["rate"])
     percentile = max(1, round((below_or_equal / len(entries)) * 100))
+    per_day = format_ratio(target["rate"])
     return (
         f"{target['display_name']} has sent {target['messages']} messages in {target['days']} days "
+        f"({per_day}/day) "
         f"since his first message ({ordinal_suffix(percentile)} percentile)."
     )
 
@@ -686,6 +738,27 @@ def percentile_text_for_name(group_id: str, name_query: str) -> str:
     return percentile_text_for_entry(entries, target)
 
 
+def yap_leaderboard_text(group_id: str) -> str:
+    entries = build_user_rates(group_id)
+    ranked = [entry for entry in entries if entry["messages"] > 0]
+    if not ranked:
+        return "Not enough data yet."
+
+    ranked.sort(
+        key=lambda e: (e["rate"], e["messages"], e["display_name"].lower()),
+        reverse=True,
+    )
+    top = ranked[:10]
+
+    lines = ["top 10 yap:"]
+    for idx, entry in enumerate(top, start=1):
+        lines.append(
+            f"{idx}. {entry['display_name']} - {format_ratio(entry['rate'])}/day "
+            f"({entry['messages']} messages in {entry['days']} days)"
+        )
+    return "\n".join(lines)
+
+
 def run_command(payload: Dict) -> Optional[str]:
     text = normalize_text(payload.get("text"))
     if not text.lower().startswith(COMMAND):
@@ -711,6 +784,8 @@ def run_command(payload: Dict) -> Optional[str]:
         return leaderboard_text(group_id)
     if tail.lower() == "likes":
         return top_liked_messages_text(group_id)
+    if tail.lower() == "yap":
+        return yap_leaderboard_text(group_id)
 
     return percentile_text_for_name(group_id, tail)
 
@@ -741,7 +816,7 @@ def groupme_callback():
 
     reply = run_command(payload)
     if reply:
-        post_to_groupme(reply, callback_message["group_id"], request.base_url)
+        post_reply(reply, callback_message["group_id"], request.base_url)
 
     return ("", 204)
 
