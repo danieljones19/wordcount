@@ -295,19 +295,25 @@ def post_reply(text: str, group_id: str, callback_url: str = "") -> None:
         post_to_groupme(chunk, group_id, callback_url)
 
 
-def maybe_sync_group_messages(group_id: str) -> None:
+def maybe_sync_group_messages(
+    group_id: str,
+    force: bool = False,
+    max_pages: Optional[int] = None,
+) -> Dict[str, int]:
     if not ACCESS_TOKEN:
-        return
+        return {"fetched_pages": 0, "reached_chat_start": 0}
 
     now_ts = int(time.time())
     last_sync = _last_sync_by_group.get(group_id, 0)
-    if not FULL_SYNC_ON_QUERY and now_ts - last_sync < SYNC_INTERVAL_SECONDS:
-        return
+    if not force and not FULL_SYNC_ON_QUERY and now_ts - last_sync < SYNC_INTERVAL_SECONDS:
+        return {"fetched_pages": 0, "reached_chat_start": 0}
 
     before_id = None
     pages = 0
+    reached_chat_start = False
 
-    while pages < MAX_SYNC_PAGES:
+    page_limit = MAX_SYNC_PAGES if max_pages is None else max_pages
+    while page_limit <= 0 or pages < page_limit:
         params = {"token": ACCESS_TOKEN, "limit": 100}
         if before_id:
             params["before_id"] = before_id
@@ -336,6 +342,7 @@ def maybe_sync_group_messages(group_id: str) -> None:
         body = response.json() if response.content else {}
         api_messages = (((body or {}).get("response") or {}).get("messages") or [])
         if not api_messages:
+            reached_chat_start = True
             break
 
         converted = [extract_api_message(m) for m in api_messages]
@@ -344,9 +351,30 @@ def maybe_sync_group_messages(group_id: str) -> None:
         before_id = str(api_messages[-1].get("id", "")).strip() or None
         pages += 1
         if not before_id:
+            reached_chat_start = True
             break
 
     _last_sync_by_group[group_id] = now_ts
+    return {"fetched_pages": pages, "reached_chat_start": 1 if reached_chat_start else 0}
+
+
+def oldest_message_age_days(group_id: str) -> Optional[int]:
+    with db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT MIN(created_at) AS oldest_created_at
+            FROM messages
+            WHERE group_id = ?
+              AND created_at IS NOT NULL
+              AND created_at > 0
+            """,
+            (group_id,),
+        ).fetchone()
+    oldest = safe_int(row["oldest_created_at"], 0) if row else 0
+    if oldest <= 0:
+        return None
+    now_ts = int(time.time())
+    return max(0, int((now_ts - oldest) / 86400))
 
 
 def get_group_members_map(group_id: str) -> Dict[str, Dict]:
@@ -661,6 +689,18 @@ def top_liked_messages_text(group_id: str) -> str:
     return "\n".join(lines)
 
 
+def sync_status_text(group_id: str) -> str:
+    if not ACCESS_TOKEN:
+        return "Sync unavailable: GROUPME_ACCESS_TOKEN is not set."
+    result = maybe_sync_group_messages(group_id, force=True, max_pages=0)
+    days = oldest_message_age_days(group_id)
+    if days is None:
+        return "No messages found to sync yet."
+    if result.get("reached_chat_start", 0):
+        return f"messages synced from up to {days} days ago (reached chat start)."
+    return f"messages synced from up to {days} days ago."
+
+
 def find_previous_non_command_sender(group_id: str, current_message_id: str) -> Optional[sqlite3.Row]:
     with db_connection() as conn:
         row = conn.execute(
@@ -786,6 +826,8 @@ def run_command(payload: Dict) -> Optional[str]:
         return top_liked_messages_text(group_id)
     if tail.lower() == "yap":
         return yap_leaderboard_text(group_id)
+    if tail.lower() == "sync":
+        return sync_status_text(group_id)
 
     return percentile_text_for_name(group_id, tail)
 

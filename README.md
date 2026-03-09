@@ -7,6 +7,7 @@ This bot supports exactly two commands:
 - `!wordcount <name>`
 - `!wordcount likes`
 - `!wordcount yap`
+- `!wordcount sync`
 
 ## Command behavior
 
@@ -46,6 +47,13 @@ Returns top 10 users by messages/day since first message sent:
 ```text
 top 10 yap:
 1. Name - 8.57/day (120 messages in 14 days)
+```
+
+### `!wordcount sync`
+Forces an immediate full backfill sync (until chat start) and reports how far back data currently goes:
+
+```text
+messages synced from up to 180 days ago.
 ```
 
 Comparison is based on each user's `messages / days since first seen message` rate, compared across all users in the group data the bot has.
