@@ -780,9 +780,9 @@ def percentile_text_for_name(group_id: str, name_query: str) -> str:
 
 def yap_leaderboard_text(group_id: str) -> str:
     entries = build_user_rates(group_id)
-    ranked = [entry for entry in entries if entry["messages"] > 0]
+    ranked = [entry for entry in entries if entry["messages"] > 10]
     if not ranked:
-        return "Not enough data yet."
+        return "No users with more than 10 messages yet."
 
     ranked.sort(
         key=lambda e: (e["rate"], e["messages"], e["display_name"].lower()),

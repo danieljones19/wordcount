@@ -42,7 +42,7 @@ top 5:
 ```
 
 ### `!wordcount yap`
-Returns top 10 users by messages/day since first message sent:
+Returns top 10 users by messages/day since first message sent (users must have more than 10 messages):
 
 ```text
 top 10 yap:
