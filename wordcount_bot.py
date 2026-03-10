@@ -443,6 +443,29 @@ def normalize_name_query(value: str) -> str:
     return q.lower()
 
 
+def is_current_member(group_id: str, sender_id: str) -> bool:
+    member_map = get_group_members_map(group_id)
+    if not member_map:
+        return False
+    return sender_id in member_map
+
+
+def is_group_bot_name_query(group_id: str, name_query: str) -> bool:
+    needle = normalize_name_query(name_query)
+    if not needle:
+        return False
+    bots = fetch_bots()
+    for bot in bots:
+        if str(bot.get("group_id", "")).strip() != group_id:
+            continue
+        bot_name = normalize_name_query(str(bot.get("name", "")))
+        if not bot_name:
+            continue
+        if needle == bot_name or needle in bot_name or bot_name in needle:
+            return True
+    return False
+
+
 def aggregate_user_rows(group_id: str) -> List[sqlite3.Row]:
     with db_connection() as conn:
         return conn.execute(
@@ -467,6 +490,8 @@ def aggregate_user_rows(group_id: str) -> List[sqlite3.Row]:
 def build_user_rates(group_id: str) -> List[Dict]:
     maybe_sync_group_messages(group_id)
     member_map = get_group_members_map(group_id)
+    if not member_map:
+        return []
     user_rows = aggregate_user_rows(group_id)
     now_ts = int(time.time())
 
@@ -476,8 +501,7 @@ def build_user_rates(group_id: str) -> List[Dict]:
         if sender_id:
             message_rows_by_sender[sender_id] = row
 
-    all_sender_ids = set(message_rows_by_sender.keys())
-    all_sender_ids.update(member_map.keys())
+    all_sender_ids = set(member_map.keys())
 
     entries: List[Dict] = []
     for sender_id in all_sender_ids:
@@ -508,39 +532,6 @@ def build_user_rates(group_id: str) -> List[Dict]:
             }
         )
     return entries
-
-
-def get_member_only_entry_for_query(group_id: str, name_query: str) -> Optional[Dict]:
-    member_map = get_group_members_map(group_id)
-    if not member_map:
-        return None
-
-    needle = normalize_name_query(name_query)
-    if not needle:
-        return None
-
-    for sender_id, member in member_map.items():
-        nickname = str(member.get("nickname", "")).strip()
-        real_name = str(member.get("real_name", "")).strip()
-        display = format_member_display_name(nickname, real_name, "")
-        alias_values = [
-            normalize_name_query(display),
-            normalize_name_query(nickname),
-            normalize_name_query(real_name),
-        ]
-        alias_values = [a for a in alias_values if a]
-        if needle in alias_values or any(needle in a for a in alias_values):
-            return {
-                "sender_id": sender_id,
-                "messages": 0,
-                "days": 0,
-                "rate": 0.0,
-                "display_name": display or "Unknown",
-                "nickname": nickname,
-                "real_name": real_name,
-                "fallback_name": display or "Unknown",
-            }
-    return None
 
 
 def find_user_entry_by_name(entries: List[Dict], name_query: str) -> Optional[Dict]:
@@ -763,21 +754,6 @@ def percentile_text_for_target(group_id: str, target_sender_id: str, target_send
     return percentile_text_for_entry(entries, fallback_target)
 
 
-def percentile_text_for_name(group_id: str, name_query: str) -> str:
-    entries = build_user_rates(group_id)
-    if not entries:
-        return "Not enough data yet."
-
-    target = find_user_entry_by_name(entries, name_query)
-    if not target:
-        member_only_target = get_member_only_entry_for_query(group_id, name_query)
-        if not member_only_target:
-            return f"Could not find member '{name_query}'."
-        entries.append(member_only_target)
-        target = member_only_target
-    return percentile_text_for_entry(entries, target)
-
-
 def yap_leaderboard_text(group_id: str) -> str:
     entries = build_user_rates(group_id)
     ranked = [entry for entry in entries if entry["messages"] > 10]
@@ -806,6 +782,7 @@ def run_command(payload: Dict) -> Optional[str]:
 
     group_id = str(payload.get("group_id", "")).strip()
     message_id = str(payload.get("id", "")).strip()
+    requester_sender_id = str(payload.get("sender_id", "")).strip()
     if not group_id:
         return None
 
@@ -814,9 +791,14 @@ def run_command(payload: Dict) -> Optional[str]:
         prev = find_previous_non_command_sender(group_id, message_id)
         if not prev:
             return "No previous non-command message found yet."
+        prev_sender_id = str(prev["sender_id"] or "").strip()
+        if not prev_sender_id:
+            return None
+        if not is_current_member(group_id, prev_sender_id):
+            return None
         return percentile_text_for_target(
             group_id,
-            str(prev["sender_id"]),
+            prev_sender_id,
             str(prev["sender_name"] or "Unknown"),
         )
 
@@ -829,7 +811,18 @@ def run_command(payload: Dict) -> Optional[str]:
     if tail.lower() == "sync":
         return sync_status_text(group_id)
 
-    return percentile_text_for_name(group_id, tail)
+    if is_group_bot_name_query(group_id, tail):
+        return None
+
+    entries = build_user_rates(group_id)
+    if not entries:
+        return "Could not fetch current member list right now."
+    target = find_user_entry_by_name(entries, tail)
+    if not target:
+        return f"Could not find current member '{tail}'."
+    if requester_sender_id and target["sender_id"] == requester_sender_id:
+        return None
+    return percentile_text_for_entry(entries, target)
 
 
 @app.get("/")

@@ -29,9 +29,13 @@ Looks at the most recent non-command message before `!wordcount`, then returns:
 ```text
 Name has sent X messages in Y days (R/day) since his first message (Zth percentile).
 ```
+Only current group members are considered.
 
 ### `!wordcount <name>`
 Looks up a specific member by nickname or real name, then returns the same message/rate output.
+- Only current group members are valid targets.
+- If user queries themselves, the bot does not reply.
+- If user queries a bot name, the bot does not reply.
 
 ### `!wordcount likes`
 Returns top 5 highest-like messages of all time in the chat, regardless of current/past membership:
@@ -57,6 +61,8 @@ messages synced from up to 180 days ago.
 ```
 
 Comparison is based on each user's `messages / days since first seen message` rate, compared across all users in the group data the bot has.
+For `!wordcount`, `!wordcount <name>`, `!wordcount leaderboard`, and `!wordcount yap`, calculations are current-members-only.
+`!wordcount likes` is the one command that can include past members.
 
 ## Important limitations
 - GroupMe bot callbacks alone are not enough for accurate likes history over time.
